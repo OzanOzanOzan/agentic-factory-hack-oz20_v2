@@ -257,6 +257,12 @@ if ! az account show >/dev/null 2>&1; then
         exit 0
 fi
 
+if ! az account get-access-token --resource-type arm >/dev/null 2>&1; then
+	echo "⚠️ APIM seeding skipped: Azure CLI session is not valid for Azure Resource Manager."
+	echo "   Run 'az login --use-device-code' and re-run this script."
+	exit 0
+fi
+
 # Validate required env vars (they should come from repo-root .env via challenge-0/get-keys.sh)
 missing_vars=()
 for v in AZURE_SUBSCRIPTION_ID RESOURCE_GROUP APIM_NAME COSMOS_ENDPOINT; do
@@ -270,15 +276,33 @@ if [ ${#missing_vars[@]} -ne 0 ]; then
         exit 0
 fi
 
+apim_access_output="$(az apim show --name "$APIM_NAME" --resource-group "$RESOURCE_GROUP" --query name -o tsv 2>&1)"
+if [ $? -ne 0 ] || [ -z "$apim_access_output" ]; then
+	echo "⚠️ APIM seeding skipped: unable to access API Management service '$APIM_NAME'."
+	if printf '%s' "$apim_access_output" | grep -qi 'claims challenge'; then
+		echo "   Azure requested an MFA or claims challenge for Azure Resource Manager."
+		printf '%s\n' "$apim_access_output" | grep -o 'az login --claims-challenge[^[:cntrl:]]*' | head -n 1 | sed 's/^/   Run: /'
+	elif printf '%s' "$apim_access_output" | grep -qi 'requestdisallowedbyazure\|mfa'; then
+		echo "   Azure blocked the request because this tenant requires MFA for management operations."
+		echo "   Run 'az login --use-device-code' again, complete MFA, then rerun the script."
+	else
+		echo "   Check that the APIM name and resource group are correct and that your role assignments have propagated."
+	fi
+	exit 0
+fi
+
 echo "📦 Installing required Python packages for APIM..."
 pip3 install azure-identity azure-mgmt-apimanagement==4.0.0 --quiet
 
 echo "📝 Generating APIM setup script (Cosmos via Managed Identity)..."
 cat > seed_apim_cosmos_mi.py << 'EOF'
 import os
+import re
+import sys
 from urllib.parse import urlparse
 
-from azure.identity import AzureCliCredential
+from azure.core.exceptions import HttpResponseError
+from azure.identity import AzureCliCredential, CredentialUnavailableError
 from azure.mgmt.apimanagement import ApiManagementClient
 from azure.mgmt.apimanagement.models import (
         ApiCreateOrUpdateParameter,
@@ -313,6 +337,31 @@ resource_attr = f"{parsed.scheme}://{parsed.hostname}"
 
 print(f"ℹ️  Cosmos endpoint: {cosmos_endpoint}")
 print(f"ℹ️  MI resource: {resource_attr}")
+
+ARM_SCOPE = "https://management.azure.com/.default"
+
+
+def print_claims_challenge_help(message: str):
+        match = re.search(r"(az login --claims-challenge[^\r\n]*)", message)
+        if match:
+                print("   Azure requested an MFA or claims challenge. Run this command, then rerun seed-data.sh:", file=sys.stderr)
+                print(f"   {match.group(1)}", file=sys.stderr)
+
+
+def create_apim_client() -> ApiManagementClient:
+        try:
+                credential = AzureCliCredential()
+                credential.get_token(ARM_SCOPE)
+                print("✅ Azure CLI authentication is valid for Azure Resource Manager")
+                return ApiManagementClient(credential, sub_id)
+        except CredentialUnavailableError as exc:
+                message = str(exc)
+                print("❌ Azure CLI authentication is not sufficient for APIM provisioning.", file=sys.stderr)
+                print_claims_challenge_help(message)
+                if "claims challenge" not in message.lower():
+                        print("   Run 'az login --use-device-code' again, complete MFA if prompted, then rerun the script.", file=sys.stderr)
+                print(f"   Details: {message}", file=sys.stderr)
+                raise SystemExit(1)
 
 
 def policy_query_all(collection: str) -> str:
@@ -432,8 +481,7 @@ def policy_query_by_id(collection: str, param_name: str, field: str) -> str:
         ).strip()
 
 
-cred = AzureCliCredential()
-client = ApiManagementClient(cred, sub_id)
+client = create_apim_client()
 
 
 def create_api(api_id: str, display_name: str, description: str, path: str):
@@ -450,138 +498,155 @@ def create_api(api_id: str, display_name: str, description: str, path: str):
                 ),
         ).result()
 
+def main():
+        try:
+                print("📡 Creating Machine API...")
+                machine_api_id = "machine-api"
+                create_api(
+                        machine_api_id,
+                        display_name="Machine API",
+                        description="Machines via Cosmos DB (APIM Managed Identity)",
+                        path="machine",
+                )
 
-print("📡 Creating Machine API...")
-machine_api_id = "machine-api"
-create_api(
-        machine_api_id,
-        display_name="Machine API",
-        description="Machines via Cosmos DB (APIM Managed Identity)",
-        path="machine",
-)
+                print("📡 Creating List Machines operation...")
+                client.api_operation.create_or_update(
+                        rg,
+                        service,
+                        machine_api_id,
+                        "list-machines",
+                        OperationContract(
+                                display_name="List Machines",
+                                description="Retrieves all machines from the factory operations database.",
+                                method="GET",
+                                url_template="/",
+                                template_parameters=[],
+                                responses=[ResponseContract(status_code=200, description="OK")],
+                        ),
+                )
+                client.api_operation_policy.create_or_update(
+                        rg,
+                        service,
+                        machine_api_id,
+                        "list-machines",
+                        "policy",
+                        parameters=PolicyContract(value=policy_query_all("Machines"), format="rawxml"),
+                )
 
-print("📡 Creating List Machines operation...")
-client.api_operation.create_or_update(
-        rg,
-        service,
-        machine_api_id,
-        "list-machines",
-        OperationContract(
-                display_name="List Machines",
-                description="Retrieves all machines from the factory operations database.",
-                method="GET",
-                url_template="/",
-                template_parameters=[],
-                responses=[ResponseContract(status_code=200, description="OK")],
-        ),
-)
-client.api_operation_policy.create_or_update(
-        rg,
-        service,
-        machine_api_id,
-        "list-machines",
-        "policy",
-        parameters=PolicyContract(value=policy_query_all("Machines"), format="rawxml"),
-)
+                print("📡 Creating Get Machine operation...")
+                client.api_operation.create_or_update(
+                        rg,
+                        service,
+                        machine_api_id,
+                        "get-machine",
+                        OperationContract(
+                                display_name="Get Machine",
+                                description="Retrieves a specific machine by its unique identifier.",
+                                method="GET",
+                                url_template="/{id}",
+                                template_parameters=[ParameterContract(name="id", type="string", required=True)],
+                                responses=[
+                                        ResponseContract(status_code=200, description="OK"),
+                                        ResponseContract(status_code=404, description="Not Found"),
+                                ],
+                        ),
+                )
+                client.api_operation_policy.create_or_update(
+                        rg,
+                        service,
+                        machine_api_id,
+                        "get-machine",
+                        "policy",
+                        parameters=PolicyContract(value=policy_query_by_id("Machines", "id", "id"), format="rawxml"),
+                )
 
-print("📡 Creating Get Machine operation...")
-client.api_operation.create_or_update(
-        rg,
-        service,
-        machine_api_id,
-        "get-machine",
-        OperationContract(
-                display_name="Get Machine",
-                description="Retrieves a specific machine by its unique identifier.",
-                method="GET",
-                url_template="/{id}",
-                template_parameters=[ParameterContract(name="id", type="string", required=True)],
-                responses=[
-                        ResponseContract(status_code=200, description="OK"),
-                        ResponseContract(status_code=404, description="Not Found"),
-                ],
-        ),
-)
-client.api_operation_policy.create_or_update(
-        rg,
-        service,
-        machine_api_id,
-        "get-machine",
-        "policy",
-        parameters=PolicyContract(value=policy_query_by_id("Machines", "id", "id"), format="rawxml"),
-)
+                print("✅ APIM Machine API deployed: path=/machine (Cosmos via Managed Identity)")
 
-print("✅ APIM Machine API deployed: path=/machine (Cosmos via Managed Identity)")
+                print("📡 Creating Maintenance API...")
+                maintenance_api_id = "maintenance-api"
+                create_api(
+                        maintenance_api_id,
+                        display_name="Maintenance API",
+                        description="Thresholds via Cosmos DB (APIM Managed Identity)",
+                        path="maintenance",
+                )
+
+                print("📡 Creating List Thresholds operation...")
+                client.api_operation.create_or_update(
+                        rg,
+                        service,
+                        maintenance_api_id,
+                        "list-thresholds",
+                        OperationContract(
+                                display_name="List Thresholds",
+                                description="Retrieves all operational thresholds for factory equipment.",
+                                method="GET",
+                                url_template="/",
+                                template_parameters=[],
+                                responses=[ResponseContract(status_code=200, description="OK")],
+                        ),
+                )
+                client.api_operation_policy.create_or_update(
+                        rg,
+                        service,
+                        maintenance_api_id,
+                        "list-thresholds",
+                        "policy",
+                        parameters=PolicyContract(value=policy_query_all("Thresholds"), format="rawxml"),
+                )
+
+                print("📡 Creating Get Threshold operation...")
+                client.api_operation.create_or_update(
+                        rg,
+                        service,
+                        maintenance_api_id,
+                        "get-threshold",
+                        OperationContract(
+                                display_name="Get Threshold",
+                                description="Retrieves operational thresholds for a specific machine type.",
+                                method="GET",
+                                url_template="/{machineType}",
+                                template_parameters=[ParameterContract(name="machineType", type="string", required=True)],
+                                responses=[
+                                        ResponseContract(status_code=200, description="OK"),
+                                        ResponseContract(status_code=404, description="Not Found"),
+                                ],
+                        ),
+                )
+                client.api_operation_policy.create_or_update(
+                        rg,
+                        service,
+                        maintenance_api_id,
+                        "get-threshold",
+                        "policy",
+                        parameters=PolicyContract(
+                                value=policy_query_by_id("Thresholds", "machineType", "machineType"),
+                                format="rawxml",
+                        ),
+                )
+
+                print("✅ APIM Maintenance API deployed: path=/maintenance (Cosmos via Managed Identity)")
+        except HttpResponseError as exc:
+                message = str(exc)
+                print("❌ APIM provisioning failed.", file=sys.stderr)
+                if "RequestDisallowedByAzure" in message or "without authenticating through MFA" in message:
+                        print("   Azure blocked the management request because your session does not satisfy MFA requirements.", file=sys.stderr)
+                        print("   Run 'az login --use-device-code' again, complete MFA, then rerun seed-data.sh.", file=sys.stderr)
+                print_claims_challenge_help(message)
+                print(f"   Details: {message}", file=sys.stderr)
+                raise SystemExit(1)
 
 
-print("📡 Creating Maintenance API...")
-maintenance_api_id = "maintenance-api"
-create_api(
-        maintenance_api_id,
-        display_name="Maintenance API",
-        description="Thresholds via Cosmos DB (APIM Managed Identity)",
-        path="maintenance",
-)
-
-print("📡 Creating List Thresholds operation...")
-client.api_operation.create_or_update(
-        rg,
-        service,
-        maintenance_api_id,
-        "list-thresholds",
-        OperationContract(
-                display_name="List Thresholds",
-                description="Retrieves all operational thresholds for factory equipment.",
-                method="GET",
-                url_template="/",
-                template_parameters=[],
-                responses=[ResponseContract(status_code=200, description="OK")],
-        ),
-)
-client.api_operation_policy.create_or_update(
-        rg,
-        service,
-        maintenance_api_id,
-        "list-thresholds",
-        "policy",
-        parameters=PolicyContract(value=policy_query_all("Thresholds"), format="rawxml"),
-)
-
-print("📡 Creating Get Threshold operation...")
-client.api_operation.create_or_update(
-        rg,
-        service,
-        maintenance_api_id,
-        "get-threshold",
-        OperationContract(
-                display_name="Get Threshold",
-                description="Retrieves operational thresholds for a specific machine type.",
-                method="GET",
-                url_template="/{machineType}",
-                template_parameters=[ParameterContract(name="machineType", type="string", required=True)],
-                responses=[
-                        ResponseContract(status_code=200, description="OK"),
-                        ResponseContract(status_code=404, description="Not Found"),
-                ],
-        ),
-)
-client.api_operation_policy.create_or_update(
-        rg,
-        service,
-        maintenance_api_id,
-        "get-threshold",
-        "policy",
-        parameters=PolicyContract(
-                value=policy_query_by_id("Thresholds", "machineType", "machineType"),
-                format="rawxml",
-        ),
-)
-
-print("✅ APIM Maintenance API deployed: path=/maintenance (Cosmos via Managed Identity)")
+if __name__ == "__main__":
+        main()
 EOF
 
 echo "🐍 Running APIM setup (Managed Identity to Cosmos)..."
-python3 seed_apim_cosmos_mi.py
+if ! python3 seed_apim_cosmos_mi.py; then
+	echo "⚠️ APIM seeding did not complete. Resolve the authentication issue above and rerun ./seed-data.sh."
+	rm -f seed_apim_cosmos_mi.py
+	exit 1
+fi
 
 echo "🧹 Cleaning up APIM seeding script..."
 rm -f seed_apim_cosmos_mi.py
